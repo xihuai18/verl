@@ -360,6 +360,7 @@ class RayPPOTrainer:
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
         )
+        self.current_epoch = 0  # Initialize current epoch
 
         # if ref_in_actor is True, the reference policy will be actor without lora applied
         self.ref_in_actor = config.actor_rollout_ref.model.get("lora_rank", 0) > 0
@@ -972,11 +973,19 @@ class RayPPOTrainer:
                 critic_local_path, critic_remote_path, self.global_steps, max_ckpt_to_keep=max_critic_ckpt_to_keep
             )
 
-        # save dataloader
+        # save dataloader and epoch info
         local_mkdir_safe(local_global_step_folder)
         dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
+        epoch_info_path = os.path.join(local_global_step_folder, "epoch_info.pt")
+
         dataloader_state_dict = self.train_dataloader.state_dict()
         torch.save(dataloader_state_dict, dataloader_local_path)
+
+        # Save epoch info
+        epoch_info = {
+            "epoch": self.current_epoch,
+        }
+        torch.save(epoch_info, epoch_info_path)
 
         # latest checkpointed iteration tracker (for atomic usage)
         local_latest_checkpointed_iteration = os.path.join(
@@ -1033,14 +1042,26 @@ class RayPPOTrainer:
                 critic_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
             )
 
-        # load dataloader,
+        # load dataloader and epoch info
         # TODO: from remote not implemented yet
         dataloader_local_path = os.path.join(global_step_folder, "data.pt")
+        epoch_info_path = os.path.join(global_step_folder, "epoch_info.pt")
+
         if os.path.exists(dataloader_local_path):
             dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
             self.train_dataloader.load_state_dict(dataloader_state_dict)
+
+            # Load epoch info if exists
+            if os.path.exists(epoch_info_path):
+                epoch_info = torch.load(epoch_info_path, weights_only=False)
+                self.current_epoch = epoch_info.get("epoch", 0)
+                print(f"Resuming from epoch {self.current_epoch}")
+            else:
+                self.current_epoch = 0
+                print("No epoch info found, starting from epoch 0")
         else:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
+            self.current_epoch = 0
 
     def _start_profiling(self, do_profile: bool) -> None:
         """Start profiling for all worker groups if profiling is enabled."""
@@ -1122,7 +1143,7 @@ class RayPPOTrainer:
         last_val_metrics = None
         self.max_steps_duration = 0
 
-        for epoch in range(self.config.trainer.total_epochs):
+        for epoch in range(self.current_epoch, self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 metrics = {}
                 timing_raw = {}
